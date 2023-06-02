@@ -20,6 +20,7 @@ from tqdm import tqdm
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from torch.utils.tensorboard import SummaryWriter
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # set gpu
 
 warnings.simplefilter('ignore')
 def seed_everything(seed):
@@ -31,6 +32,20 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True
 
+def get_args_parser():
+    parser = ArgumentParser(description="Training script for ImageClassification",formatter_class=ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--models', default='efficientnet-b0', type=str, 
+                        choices= ['efficientnet-b0', 'efficientnet-b1', 'efficientnet-b2', 'efficientnet-b3', 'efficientnet-b4'], 
+                        help='Base model name')
+    parser.add_argument('--image-path', default='./data/', type=str, help='Image dataset path')
+    parser.add_argument('--label-csv', default='label.csv', type=str, help='label csv path')
+    parser.add_argument('--learning-rate', default= 1e-4, type=float, help='base learning rate')
+    parser.add_argument('--input-size', default=256, type=int, help='images input size')
+    parser.add_argument('--epochs', default=120, type=int, help='epochs')
+    parser.add_argument('--batch', default=64, type=int, help='Batch by GPU')
+    parser.add_argument('--save-path', default='models', type=str, help='model save path')
+    parser.add_argument('--label-num', default=38, type=str, help='label number')
+    return parser
 
 class commercial_vehicle_Dataset(Dataset):
     def __init__(self, df: pd.DataFrame, imfolder: str, train: bool = True, transforms = None):
@@ -66,7 +81,25 @@ class commercial_vehicle_Dataset(Dataset):
         return len(self.df)
 
 
-def train_model(args, model, dataloaders, criterion, optimizer,  writer, num_epochs=25): # scheduler,
+def train_model(args, model, dataloaders, criterion, optimizer,  writer, num_epochs=25):
+    """
+    model training
+    Args:
+        model (torch model) : torch model before train
+        dataloaders : torch dataloader 
+        criterion : loss function, cross-entropy
+        optimizer : Lion optimizer
+        writer : tensorboard writer
+        num_epochs (int) : number of training epochs
+    return:
+        model : Model at peak performance in valid
+        best_idx (int): The epoch of the model at peak performance in valid
+        best_acc (float): The accuracy of the model at peak performance in valid
+        train_loss (list) : Total train loss list
+        train_acc (list) : Total train accuracy list
+        valid_loss (list) : Total validation loss list
+        valid_acc (list) : Total validation accuracy list
+    """
     since = time.time()
 
     best_model_wts = copy.deepcopy(model.state_dict())
@@ -142,7 +175,7 @@ def train_model(args, model, dataloaders, criterion, optimizer,  writer, num_epo
     print('Best valid Acc: %d - %.1f' %(best_idx, best_acc))
 
     # load best model weights
-    model.load_state_dict(best_model_wts)
+    model = best_model_wts
     torch.save(model, f'{args.save_path}/{args.models}_president_model.pth')
     print('model saved')
     return model, best_idx, best_acc, train_loss, train_acc, valid_loss, valid_acc
@@ -218,24 +251,8 @@ class Lion(Optimizer):
 
     return loss
 
-if __name__ == "__main__":
-    parser = ArgumentParser(description="Training script for ImageClassification",formatter_class=ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--models', default='efficientnet-b0', type=str, 
-                        choices= ['efficientnet-b0', 'efficientnet-b1', 'efficientnet-b2', 'efficientnet-b3', 'efficientnet-b4'], 
-                        help='Base model name')
-    parser.add_argument('--image-path', default='./data/', type=str, help='Image dataset path')
-    parser.add_argument('--label-csv', default='label.csv', type=str, help='label csv path')
-    parser.add_argument('--learning-rate', default= 1e-4, type=float, help='base learning rate')
-    parser.add_argument('--input-size', default=256, type=int, help='images input size')
-    parser.add_argument('--epochs', default=120, type=int, help='epochs')
-    parser.add_argument('--batch', default=64, type=int, help='Batch by GPU')
-    parser.add_argument('--save-path', default='models', type=str, help='model save path')
-    parser.add_argument('--label-num', default=38, type=str, help='label number')
-    args = parser.parse_args()
-    seed_everything(47)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # set gpu
-    
+def main():    
     # model select
     if args.models in ['efficientnet-b0', 'efficientnet-b1', 'efficientnet-b2', 'efficientnet-b3', 'efficientnet-b4'] :
         from efficientnet_pytorch import EfficientNet
@@ -262,6 +279,7 @@ if __name__ == "__main__":
     valid_df, test_df = train_test_split(test_df, test_size=0.5, stratify=test_df['label'])
     
 
+
     train = commercial_vehicle_Dataset(df = train_df,
                                     imfolder= args.image_path,
                                     train=True,
@@ -280,18 +298,25 @@ if __name__ == "__main__":
 
     batch_size = args.batch
 
+    train_sampler = torch.utils.data.DistributedSampler(train, shuffle=True)
+    valid_sampler = torch.utils.data.DistributedSampler(valid , shuffle=True)
+    test_sampler = torch.utils.data.DistributedSampler(test, shuffle=True)
+
     dataloaders = {}
     dataloaders['train'] = DataLoader(dataset=train, 
+                                      sampler=train_sampler, 
                                       batch_size=batch_size, 
                                       shuffle=True,
                                       num_workers=12
                                       )
     dataloaders['valid'] = DataLoader(dataset=valid, 
+                                      sampler=valid_sampler, 
                                       batch_size=batch_size, 
                                       shuffle=False,
                                       num_workers=12
                                       )
     dataloaders['test'] = DataLoader(dataset=test, 
+                                     sampler=test_sampler,
                                       batch_size=batch_size, 
                                       shuffle=False,
                                       num_workers=12
@@ -315,13 +340,20 @@ if __name__ == "__main__":
     # model save folder
     os.makedirs(args.save_path, exist_ok=True) 
 
-    # train
+    # multi gpu
     if torch.cuda.device_count() > 1:
       print("Let's use", torch.cuda.device_count(), "GPUs!")
       # dim = 0 [30, xxx] -> [10, ...], [10, ...], [10, ...] on 3 GPUs
       model = nn.DataParallel(model)
 
     model.to(device)
-    model, best_idx, best_acc, train_loss, train_acc, valid_loss, valid_acc = train_model(args, model, dataloaders, criterion, optim ,  writer , num_epochs=args.epochs) # scheduler ,
+    model, best_idx, best_acc, train_loss, train_acc, valid_loss, valid_acc = \
+      train_model(args, model, dataloaders, criterion, optim ,  writer , num_epochs=args.epochs)
 
     writer.close()
+
+if __name__ == "__main__":
+    parser = ArgumentParser("Training script for ImageClassification", parents=[get_args_parser()])
+    args = parser.parse_args()
+    seed_everything(47)
+    main()
