@@ -2,7 +2,8 @@ import torch
 import torchvision
 import torch.nn.functional as F
 import torch.nn as nn
-import torchtoolbox.transform as transforms
+# import torchtoolbox.transform as transforms
+from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.optimizer import Optimizer
 
@@ -264,9 +265,15 @@ def main():
         transforms.RandomResizedCrop(size=args.input_size, scale=(0.8, 1.0)),   
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
+        transforms.RandomApply(
+                [transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
+                p=0.8
+            ),
+        transforms.RandomGrayscale(p=0.2),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],std=[0.229, 0.224, 0.225])
     ])
+    
     test_transform = transforms.Compose([
         transforms.Resize((args.input_size,args.input_size)),
         transforms.ToTensor(),
