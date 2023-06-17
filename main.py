@@ -7,14 +7,11 @@ from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.optimizer import Optimizer
 
-import pandas as pd
 import numpy as np
 import os
-import cv2
 import time
 import warnings
 import random
-from sklearn.model_selection import train_test_split
 import copy
 import torch.optim as optim
 from tqdm import tqdm
@@ -38,8 +35,6 @@ def get_args_parser():
     parser.add_argument('--models', default='efficientnet-b0', type=str, 
                         choices= ['efficientnet-b0', 'efficientnet-b1', 'efficientnet-b2', 'efficientnet-b3', 'efficientnet-b4'], 
                         help='Base model name')
-    parser.add_argument('--image-path', default='./data/', type=str, help='Image dataset path')
-    parser.add_argument('--label-csv', default='label.csv', type=str, help='label csv path')
     parser.add_argument('--learning-rate', default= 1e-4, type=float, help='base learning rate')
     parser.add_argument('--input-size', default=256, type=int, help='images input size')
     parser.add_argument('--epochs', default=120, type=int, help='epochs')
@@ -47,40 +42,6 @@ def get_args_parser():
     parser.add_argument('--save-path', default='models', type=str, help='model save path')
     parser.add_argument('--label-num', default=38, type=str, help='label number')
     return parser
-
-class commercial_vehicle_Dataset(Dataset):
-    def __init__(self, df: pd.DataFrame, imfolder: str, train: bool = True, transforms = None):
-        """
-        Class initialization
-        Args:
-            df (pd.DataFrame): DataFrame with data description
-            imfolder (str): folder with images
-            train (bool): flag of whether a training dataset is being initialized or testing one
-            transforms: image transformation method to be applied
-        """
-        self.df = df
-        self.imfolder = imfolder
-        self.transforms = transforms
-        self.train = train
-        
-    def __getitem__(self, index):
-        im_path = os.path.join(self.imfolder, self.df.iloc[index]['file_path'])
-        ff = np.fromfile(im_path , np.uint8)
-        x = cv2.imdecode(ff, cv2.IMREAD_UNCHANGED)
-        x = cv2.cvtColor(x, cv2.COLOR_BGR2RGB)
-
-        if self.transforms:
-            x = self.transforms(x)
-            
-        if self.train:
-            y = self.df.iloc[index]['label']
-            return x, y
-        else:
-            return x
-    
-    def __len__(self):
-        return len(self.df)
-
 
 def train_model(args, model, dataloaders, criterion, optimizer,  writer, num_epochs=25):
     """
@@ -280,50 +241,22 @@ def main():
         transforms.Normalize(mean=[0.485, 0.456, 0.406],std=[0.229, 0.224, 0.225])
     ])
 
-    # data loader setup
-    df = pd.read_csv(args.label_csv,index_col=0)
-    train_df, test_df = train_test_split(df, test_size=0.2, stratify=df['label'])
-    valid_df, test_df = train_test_split(test_df, test_size=0.5, stratify=test_df['label'])
-    
-
-
-    train = commercial_vehicle_Dataset(df = train_df,
-                                    imfolder= args.image_path,
-                                    train=True,
-                                    transforms=train_transform
-                                    )
-    valid = commercial_vehicle_Dataset(df = valid_df,
-                                    imfolder= args.image_path,
-                                    train=True,
-                                    transforms=test_transform 
-                                    )
-    test = commercial_vehicle_Dataset(df = test_df,
-                                    imfolder= args.image_path,
-                                    train=True,
-                                    transforms=test_transform 
-                                    )
+    # dataset_load
+    train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=train_transform)
+    test_dataset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=test_transform)
 
     batch_size = args.batch
 
-    train_sampler = torch.utils.data.DistributedSampler(train, shuffle=True)
-    valid_sampler = torch.utils.data.DistributedSampler(valid , shuffle=True)
-    test_sampler = torch.utils.data.DistributedSampler(test, shuffle=True)
+    # train_sampler = torch.utils.data.DistributedSampler(train_dataset, shuffle=True)
+    # test_sampler = torch.utils.data.DistributedSampler(test_dataset, shuffle=False)
 
     dataloaders = {}
-    dataloaders['train'] = DataLoader(dataset=train, 
-                                      sampler=train_sampler, 
+    dataloaders['train'] = DataLoader(dataset=train_dataset, 
                                       batch_size=batch_size, 
                                       shuffle=True,
                                       num_workers=12
                                       )
-    dataloaders['valid'] = DataLoader(dataset=valid, 
-                                      sampler=valid_sampler, 
-                                      batch_size=batch_size, 
-                                      shuffle=False,
-                                      num_workers=12
-                                      )
-    dataloaders['test'] = DataLoader(dataset=test, 
-                                     sampler=test_sampler,
+    dataloaders['valid'] = DataLoader(dataset=test_dataset, 
                                       batch_size=batch_size, 
                                       shuffle=False,
                                       num_workers=12
@@ -360,7 +293,16 @@ def main():
     writer.close()
 
 if __name__ == "__main__":
-    parser = ArgumentParser("Training script for ImageClassification", parents=[get_args_parser()])
+    parser = ArgumentParser(description="Training script for ImageClassification",formatter_class=ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--models', default='efficientnet-b0', type=str, 
+                        choices= ['efficientnet-b0', 'efficientnet-b1', 'efficientnet-b2', 'efficientnet-b3', 'efficientnet-b4'], 
+                        help='Base model name')
+    parser.add_argument('--learning-rate', default= 1e-4, type=float, help='base learning rate')
+    parser.add_argument('--input-size', default=256, type=int, help='images input size')
+    parser.add_argument('--epochs', default=120, type=int, help='epochs')
+    parser.add_argument('--batch', default=64, type=int, help='Batch by GPU')
+    parser.add_argument('--save-path', default='models', type=str, help='model save path')
+    parser.add_argument('--label-num', default=10, type=str, help='label number')
     args = parser.parse_args()
     seed_everything(47)
     main()
