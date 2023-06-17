@@ -19,7 +19,7 @@ docker run -it --name efficientnet --gpus all --ipc=host -v `pwd`:/workspace doc
 python main.py --batch 512
 ```
 
-* Check process TensorBoard
+* Check TensorBoard
 ```bash
  tensorboard --logdir=runs
 ```
