@@ -30,19 +30,6 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True
 
-def get_args_parser():
-    parser = ArgumentParser(description="Training script for ImageClassification",formatter_class=ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--models', default='efficientnet-b0', type=str, 
-                        choices= ['efficientnet-b0', 'efficientnet-b1', 'efficientnet-b2', 'efficientnet-b3', 'efficientnet-b4'], 
-                        help='Base model name')
-    parser.add_argument('--learning-rate', default= 1e-4, type=float, help='base learning rate')
-    parser.add_argument('--input-size', default=256, type=int, help='images input size')
-    parser.add_argument('--epochs', default=120, type=int, help='epochs')
-    parser.add_argument('--batch', default=64, type=int, help='Batch by GPU')
-    parser.add_argument('--save-path', default='models', type=str, help='model save path')
-    parser.add_argument('--label-num', default=38, type=str, help='label number')
-    return parser
-
 def train_model(args, model, dataloaders, criterion, optimizer,  writer, num_epochs=25):
     """
     model training
