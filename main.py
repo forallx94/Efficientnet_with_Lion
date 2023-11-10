@@ -4,7 +4,6 @@ import torch.nn.functional as F
 import torch.nn as nn
 # import torchtoolbox.transform as transforms
 from torchvision import transforms
-from torch.utils.data import Dataset, DataLoader
 from torch.optim.optimizer import Optimizer
 
 import numpy as np
@@ -13,12 +12,37 @@ import time
 import warnings
 import random
 import copy
-import torch.optim as optim
 from tqdm import tqdm
+from timm.loss import LabelSmoothingCrossEntropy
+import torch.distributed as dist
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from torch.utils.tensorboard import SummaryWriter
 
+from logger import create_logger
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # set gpu
+
+
+def parse_option():
+    parser = ArgumentParser(description="Training script for ImageClassification",formatter_class=ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--data-path', type=str, help='path to dataset')
+    parser.add_argument('--models', default='efficientnet-b0', type=str,
+                        choices= ['efficientnet-b0', 'efficientnet-b1', 'efficientnet-b2', 'efficientnet-b3',
+                                  'efficientnet-b4', 'efficientnet-b5', 'efficientnet-b6', 'efficientnet-b7',] ,
+                        help='Base model name')
+    parser.add_argument('--learning-rate', default= 1e-4, type=float, help='base learning rate')
+    parser.add_argument('--label-smoothing', default= 0, type=float, help='label smoothing rate')
+    parser.add_argument('--input-size', default=256, type=int, help='images input size')
+    parser.add_argument('--epochs', default=120, type=int, help='epochs')
+    parser.add_argument('--batch', default=64, type=int, help='Batch by GPU')
+    parser.add_argument('--output', default='output', type=str, help='model save path')
+    parser.add_argument('--label-num', default=10, type=int , help='label number')
+
+      # distributed training
+    parser.add_argument("--local-rank", type=int, required=True, help='local rank for DistributedDataParallel')
+
+    args, unparsed = parser.parse_known_args()
+    return args
 
 warnings.simplefilter('ignore')
 def seed_everything(seed):
@@ -30,12 +54,74 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True
 
+def build_loader(args):
+    # data augmentation
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(size=args.input_size, scale=(0.8, 1.0)),
+        transforms.AutoAugment(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],std=[0.229, 0.224, 0.225])
+    ])
+        # transforms.RandomHorizontalFlip(),
+        # transforms.RandomVerticalFlip(),
+        # transforms.RandomApply(
+        #         [transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
+        #         p=0.8
+        #     ),
+        # transforms.RandomGrayscale(p=0.2),
+
+
+    val_transform = transforms.Compose([
+        transforms.Resize((args.input_size,args.input_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],std=[0.229, 0.224, 0.225])
+    ])
+
+    # dataset_load
+    if args.data_path == 'CIFAR10':
+      train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=train_transform)
+      val_dataset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=val_transform)
+    else:
+      train_dataset = torchvision.datasets.ImageFolder(f'{args.data_path}/train', transform=train_transform)
+      val_dataset = torchvision.datasets.ImageFolder(f'{args.data_path}/valid', transform=val_transform)
+
+    # train_sampler = torch.utils.data.DistributedSampler(train_dataset, shuffle=True)
+    # val_sampler = torch.utils.data.DistributedSampler(val_dataset, shuffle=False)
+
+    num_tasks = dist.get_world_size()
+    global_rank = dist.get_rank()
+    sampler_train = torch.utils.data.DistributedSampler(
+        train_dataset, num_replicas=num_tasks, rank=global_rank, shuffle=True
+    )
+    sampler_val = torch.utils.data.distributed.DistributedSampler(
+      val_dataset, shuffle=False
+    )
+
+    dataloaders = {}
+    dataloaders['train'] = torch.utils.data.DataLoader(
+                                      dataset=train_dataset,
+                                      sampler=sampler_train,
+                                      batch_size= args.batch,
+                                      num_workers=8,
+                                      drop_last=True,
+                                      pin_memory=True,
+                                      )
+    dataloaders['valid'] = torch.utils.data.DataLoader(
+                                      dataset=val_dataset,
+                                      sampler=sampler_val,
+                                      batch_size= args.batch,
+                                      num_workers=8,
+                                      drop_last=False,
+                                      pin_memory=True,
+                                      )
+    return dataloaders
+
 def train_model(args, model, dataloaders, criterion, optimizer,  writer, num_epochs=25):
     """
     model training
     Args:
         model (torch model) : torch model before train
-        dataloaders : torch dataloader 
+        dataloaders : torch dataloader
         criterion : loss function, cross-entropy
         optimizer : Lion optimizer
         writer : tensorboard writer
@@ -54,7 +140,7 @@ def train_model(args, model, dataloaders, criterion, optimizer,  writer, num_epo
     best_model_wts = copy.deepcopy(model.state_dict())
     best_acc = 0.0
     train_loss, train_acc, valid_loss, valid_acc = [], [], [], []
-    
+
     for epoch in tqdm(range(num_epochs)):
 
         # Each epoch has a training and validation phase
@@ -65,7 +151,7 @@ def train_model(args, model, dataloaders, criterion, optimizer,  writer, num_epo
                 model.eval()   # Set model to evaluate mode
 
             running_loss, running_corrects, num_cnt = 0.0, 0, 0
-            
+
             with tqdm(dataloaders[phase], unit="batch") as tepoch:
               # Iterate over data.
               for inputs, labels in tepoch:
@@ -94,10 +180,10 @@ def train_model(args, model, dataloaders, criterion, optimizer,  writer, num_epo
 
             # if phase == 'train':
             #     scheduler.step()
-            
+
             epoch_loss = float(running_loss / num_cnt)
             epoch_acc  = float((running_corrects.double() / num_cnt).cpu()*100)
-            
+
             if phase == 'train':
                 writer.add_scalar('Loss/train', epoch_loss, epoch)
                 train_loss.append(epoch_loss)
@@ -109,13 +195,13 @@ def train_model(args, model, dataloaders, criterion, optimizer,  writer, num_epo
                 valid_acc.append(epoch_acc)
                 writer.add_scalar('Accuracy/valid', epoch_acc, epoch)
             print('{} Loss: {:.2f} Acc: {:.1f}'.format(phase, epoch_loss, epoch_acc))
-           
+
             # deep copy the model
             if phase == 'valid' and epoch_acc > best_acc:
                 best_idx = epoch
                 best_acc = epoch_acc
                 best_model_wts = copy.deepcopy(model)
-                torch.save(model,f'{args.save_path}/{args.models}_{best_idx}_{int(best_acc)}.pth')
+                torch.save(model,f'{args.output}/{args.models}_{best_idx}_{int(best_acc)}.pth')
                 # best_model_wts = copy.deepcopy(model.module.state_dict())
                 print('==> best model saved - %d / %.1f'%(best_idx, best_acc))
 
@@ -125,7 +211,7 @@ def train_model(args, model, dataloaders, criterion, optimizer,  writer, num_epo
 
     # load best model weights
     model = best_model_wts
-    torch.save(model, f'{args.save_path}/{args.models}_president_model.pth')
+    torch.save(model, f'{args.output}/{args.models}_president_model.pth')
     print('model saved')
     return model, best_idx, best_acc, train_loss, train_acc, valid_loss, valid_acc
 
@@ -201,57 +287,26 @@ class Lion(Optimizer):
     return loss
 
 
-def main():    
+def main(args):
     # model select
-    if args.models in ['efficientnet-b0', 'efficientnet-b1', 'efficientnet-b2', 'efficientnet-b3', 'efficientnet-b4'] :
+    if args.models in ['efficientnet-b0', 'efficientnet-b1', 'efficientnet-b2', 'efficientnet-b3',
+                      'efficientnet-b4', 'efficientnet-b5', 'efficientnet-b6', 'efficientnet-b7',]:
         from efficientnet_pytorch import EfficientNet
-        model = EfficientNet.from_pretrained(args.models, num_classes=args.label_num) # total.csv 라벨 수
+        logger.info(f"Creating model:{args.models}")
+        model = EfficientNet.from_pretrained(args.models,
+                                            num_classes=args.label_num,
+                                            weights_path=f'/workspace/pretrain_model/{args.models}.pth')
+        logger.info(str(model))
         # input_size = 256
 
-    # data augmentation
-    train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(size=args.input_size, scale=(0.8, 1.0)),   
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomVerticalFlip(),
-        transforms.RandomApply(
-                [transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
-                p=0.8
-            ),
-        transforms.RandomGrayscale(p=0.2),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],std=[0.229, 0.224, 0.225])
-    ])
-    
-    test_transform = transforms.Compose([
-        transforms.Resize((args.input_size,args.input_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],std=[0.229, 0.224, 0.225])
-    ])
-
-    # dataset_load
-    train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=train_transform)
-    test_dataset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=test_transform)
-
-    batch_size = args.batch
-
-    # train_sampler = torch.utils.data.DistributedSampler(train_dataset, shuffle=True)
-    # test_sampler = torch.utils.data.DistributedSampler(test_dataset, shuffle=False)
-
-    dataloaders = {}
-    dataloaders['train'] = DataLoader(dataset=train_dataset, 
-                                      batch_size=batch_size, 
-                                      shuffle=True,
-                                      num_workers=12
-                                      )
-    dataloaders['valid'] = DataLoader(dataset=test_dataset, 
-                                      batch_size=batch_size, 
-                                      shuffle=False,
-                                      num_workers=12
-                                      )
+    dataloaders = build_loader(args)
 
     # hyper parameter
-    criterion = nn.CrossEntropyLoss()
-    optim = Lion(model.parameters(), lr=args.learning_rate)
+    if args.label_smoothing > 0.:
+        criterion = LabelSmoothingCrossEntropy(smoothing=args.label_smoothing)
+    else:
+        criterion = torch.nn.CrossEntropyLoss()
+    optimizer = Lion(model.parameters(), lr=args.learning_rate)
 
     # tensorboard
     writer = SummaryWriter(f'runs/{args.models}') # default `log_dir` is "runs" - we'll be more specific here
@@ -265,7 +320,7 @@ def main():
     writer.add_graph(model, images) # model structure
 
     # model save folder
-    os.makedirs(args.save_path, exist_ok=True) 
+    os.makedirs(args.output, exist_ok=True)
 
     # multi gpu
     if torch.cuda.device_count() > 1:
@@ -275,21 +330,25 @@ def main():
 
     model.to(device)
     model, best_idx, best_acc, train_loss, train_acc, valid_loss, valid_acc = \
-      train_model(args, model, dataloaders, criterion, optim ,  writer , num_epochs=args.epochs)
+      train_model(args, model, dataloaders, criterion, optimizer,  writer , num_epochs=args.epochs)
 
     writer.close()
 
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Training script for ImageClassification",formatter_class=ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--models', default='efficientnet-b0', type=str, 
-                        choices= ['efficientnet-b0', 'efficientnet-b1', 'efficientnet-b2', 'efficientnet-b3', 'efficientnet-b4'], 
-                        help='Base model name')
-    parser.add_argument('--learning-rate', default= 1e-4, type=float, help='base learning rate')
-    parser.add_argument('--input-size', default=256, type=int, help='images input size')
-    parser.add_argument('--epochs', default=120, type=int, help='epochs')
-    parser.add_argument('--batch', default=64, type=int, help='Batch by GPU')
-    parser.add_argument('--save-path', default='models', type=str, help='model save path')
-    parser.add_argument('--label-num', default=10, type=str, help='label number')
-    args = parser.parse_args()
-    seed_everything(47)
-    main()
+    args = parse_option()
+
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+      rank = int(os.environ["RANK"])
+      world_size = int(os.environ['WORLD_SIZE'])
+      print(f"RANK and WORLD_SIZE in environ: {rank}/{world_size}")
+    else:
+      rank = -1
+      world_size = -1
+    torch.cuda.set_device(args.local_rank)
+    torch.distributed.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
+    torch.distributed.barrier()
+
+    seed_everything(42)
+    os.makedirs(args.output, exist_ok=True)
+    logger = create_logger(output_dir=args.output, dist_rank=dist.get_rank(), name=f"{args.models}")
+    main(args)
