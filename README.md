@@ -15,10 +15,5 @@ docker run -it --name efficientnet --gpus all --ipc=host -v `pwd`:/workspace doc
 
 * run command
 ```bash
-python -m torch.distributed.launch --nproc_per_node 1 main.py --data-path {imagenet-path} --batch 512 --label-num 100
-```
-
-* Check TensorBoard
-```bash
- tensorboard --logdir=runs
+python -m torch.distributed.launch --nproc_per_node 3 main.py --data-path {imagenet-path} --batch 512 --label-num 100
 ```
